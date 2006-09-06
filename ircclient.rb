@@ -2,11 +2,14 @@ module IrcClient
     require 'timeout'
     require "socket"
     require 'thread'
+    require 'ircreplies'
+    require 'netutils'
 
-    ERR_NOSUCHNICK = 401
+    include IRCReplies
 
     # The irc class, which talks to the server and holds the main event loop
     class IrcActor
+        include NetUtils
         #=========================================================== 
         #events
         #=========================================================== 
@@ -20,9 +23,14 @@ module IrcClient
                 Proc.new {|server|
                     client.send_pong server
                 },
-                :servernotice=>
-                [Proc.new {|msg|
+                :pong => 
+                Proc.new {|server|
+                    puts "pong:#{server}"
+                },
+                :notice=>
+                [Proc.new {|user,channel,msg|
                     puts "Server:#{msg}"
+                    #client.msg_channel channel,"message from #{user} on #{channel} : #{msg}"
                 }],
                 :privmsg =>
                 [Proc.new {|user,channel,msg|
@@ -31,6 +39,7 @@ module IrcClient
                 }],
                 :connect =>
                 [Proc.new {|server,port,nick,pass|
+                    #puts "on connect #{server}:#{port}"
                     client.send_pass pass
                     client.send_nick nick
                     client.send_user nick,'0','*',"#{server} Net Bot"
@@ -47,9 +56,13 @@ module IrcClient
                 [Proc.new {|nick,channel,msg|
                     #puts "on part"
                 }],
+                :quit=>
+                [Proc.new {|nick,msg|
+                    #puts "on part"
+                }],
                 :unknown =>
                 [Proc.new {|line|
-                    puts "unknown message #{line}"
+                    puts ">unknown message #{line}"
                 }]
             }
         end
@@ -62,17 +75,42 @@ module IrcClient
             raise IrcError.new('wrong arity') if block.arity != 4
             self[:connect] << block
         end
+
         def on_ping(&block)
             raise IrcError.new('wrong arity') if block.arity != 1
             self[:ping] << block
         end
+
         def on_privmsg(&block)
             raise IrcError.new('wrong arity') if block.arity != 3
             self[:privmsg] << block
         end
+
+        def on_numeric(numarray,&block)
+            raise IrcError.new('wrong arity') if block.arity != 4
+            self[:numeric] << Proc.new {|server,numeric,msg,detail|
+                case numeric
+                when *numarray
+                    block.call(server,numeric,msg,detail)
+                end
+            }
+        end
+
+        def on_rpl(num,&block)
+            raise IrcError.new('wrong arity') if block.arity != 3
+            self[:numeric] << Proc.new {|server,numeric,msg,detail|
+                block.call(server,msg,detail) if num == numeric
+            }
+        end
+
+        def on_err(num,&block)
+            on_rpl(num,block)
+        end
+
         def on(method,&block)
             self[method] << block
         end
+
         #=========================================================== 
         def [](method)
             @store[method] = [] if @store[method].nil?
@@ -99,118 +137,38 @@ module IrcClient
         end
 
         def run
-            @eventlock.synchronize {
-                while true
-                    begin
-                        @eventqueue.wait(@eventlock)
+            while true
+                begin
+                    method,args = :unknown,''
+                    @eventlock.synchronize {
+                        @eventqueue.wait(@eventlock) if @events.empty?
                         method,args = @events.shift
-                        self[method].each {|block| block[*args] }
-                    rescue SystemExit => e
-                        exit 0
-                    rescue Exception => e
-                        carp e
-                    end
+                    }
+                    self[method].each {|block| block[*args] }
+                rescue SystemExit => e
+                    exit 0
+                rescue Exception => e
+                    carp e
                 end
-            }
+            end
         end
+
         def join(channel)
             @client.send_join channel
         end
+
         def part(channel)
             @client.send_part channel
         end
+
         def nick
             return @nick
         end
 
-        def carp(arg)
-            if $verbose
-                case  true
-                when arg.kind_of?(Exception)
-                    puts "#{self.class.to_s.downcase}:" + arg.message 
-                    puts arg.backtrace.collect{|s| "#{self.class.to_s.downcase}:" + s}.join("\n")
-                else
-                    puts "#{self.class.to_s.downcase}:" + arg
-                end
-            end
-        end
-        
-        #=========================================================
-        #If we need more than just names, this should go into another
-        #class.
-        #=========================================================
-        
         def names(channel)
-            if @client.class.to_s =~ /Proxy/
-                return @client.names(channel)
-            else
-                return pnames(channel)
-            end
+            return @client.names(channel)
         end 
         
-        #remote 
-        def pnames(channel)
-            carp "invoke names for #{channel}"
-            #will be invoked from a thread different from that of the
-            #primary IrcConnector thread.
-            @names = []
-            @client.send_names channel
-            @eventbuf = []
-            while true
-                @eventqueue.wait(@eventlock)
-                #wait for numeric
-                method,args = @events.shift
-                carp "#{method}->#{args}"
-                if method == :numeric
-                    server, numeric, msg, detail = args
-                    case numeric
-                    when 401
-                        #nosuch channel
-                        if msg =~ / *([^ ]+) +([^ ]+) */
-                            if $2 == channel
-                                carp "401"
-                                break
-                            else
-                                @eventbuf << [method,args]
-                            end
-                        else
-                            carp "401 message Invalid : #{message}"
-                        end
-                    when 366
-                        #end of /names list
-                        if msg =~ / +([^ ]+) */
-                            if $1 == channel
-                                carp "366 #{@names}"
-                                break
-                            else
-                                @eventbuf << [method,args]
-                            end
-                        else
-                            carp "366 message Invalid : #{message}"
-                        end
-                    when 353
-                        if msg =~ / *= +([^ ]+)*$/
-                            if $1 == channel
-                                nicks = detail.split(/ +/)
-                                nicks.each {|n| @names << $1.strip if n =~ /^@?([^ ]+)/ }
-                                carp "nicks #{nicks}"
-                            else
-                                carp "353 message Invalid : #{message}"
-                            end
-                        else
-                            @eventbuf << [method,args]
-                        end
-                    else
-                        @eventbuf << [method,args]
-                    end
-                else
-                    @eventbuf << [method,args]
-                end
-            end
-            @events = @eventbuf + @events
-            carp "returning #{@names}"
-            return @names
-        end
     end
 
     class PrintActor < IrcActor
@@ -227,6 +185,9 @@ module IrcClient
                 #client.msg_channel '#markee', "heee"
             }
             on(:part) {|nick,channel,msg|
+                #puts "#{nick} part-:#{channel}"
+            }
+            on(:quit) {|nick,msg|
                 #puts "#{nick} part-:#{channel}"
             }
         end
@@ -246,27 +207,27 @@ module IrcClient
             on(:part) {|nick,channel,msg|
                 puts "#{nick} part-:#{channel}"
             }
+            on(:quit) {|nick,msg|
+                puts "#{nick} part-:#{channel}"
+            }
             on(:privmsg) {|nick,channel,msg|
-                puts "#{nick}:#{channel} -> #{msg}"
                 case msg
                 when /^ *!who +([^ ]+) *$/
-                    begin
-                    puts ">names"
                     names = names($1)
-                    puts names
                     send_message channel, "names: #{names.join(',')}"
-                    rescue Exception => e
-                        puts e.message
-                        puts e.backtrace.join("\n")
-                    end
                 end
             }
         end
     end
 
     class IrcConnector
+        include IRCReplies
+        include NetUtils
+        extend NetUtils
+
         attr_reader :server, :port, :nick, :socket
         attr_writer :actor, :socket
+
         def initialize(server, port, nick, pass)
             @server = server
             @port = port
@@ -275,21 +236,10 @@ module IrcClient
             @actor = IrcActor.new(self)
             @readlock = Mutex.new
             @writelock = Mutex.new
-        end
 
-        def carp(arg)
-            IrcConnector.carp(arg)
-        end
-        def IrcConnector.carp(arg)
-            if $verbose
-                case  true
-                when arg.kind_of?(Exception)
-                    puts "#{self.class.to_s.downcase}:" + arg.message 
-                    puts arg.backtrace.collect{|s| "#{self.class.to_s.downcase}:" + s}.join("\n")
-                else
-                    puts "#{self.class.to_s.downcase}:" + arg
-                end
-            end
+
+            @inputlock = Mutex.new
+            @inputqueue = ConditionVariable.new
         end
 
         def run
@@ -299,34 +249,61 @@ module IrcClient
         end
 
         def connect()
-            #allow socket to be handed over from elsewhere.
-            @socket = @socket || TCPSocket.open(@server, @port)
-            @actor[:connect].each{|c| c[ @server, @port, @nick, @pass]}
+            begin
+                #allow socket to be handed over from elsewhere.
+                @socket = @socket || TCPSocket.open(@server, @port)
+                @actor[:connect].each{|c| c[ @server, @port, @nick, @pass]}
+            rescue
+                raise "Cannot connect #{@server}:#{@port}"
+            end
         end
        
         #=========================================================== 
-        def process(s)
-            s.untaint
-            case s.strip
-            when /^PING :(.+)$/i
+        def process(input)
+            input.untaint
+            s = input
+            prefix = ''
+            user = ''
+            if input =~ /^:([^ ]+) +(.*)$/
+                s = $2
+                prefix = $1
+                user = if prefix =~ /^([^!]+)!(.+)/
+                           $1
+                       else
+                           prefix
+                       end
+            end
+
+            cmd = s
+            suffix = ''
+            if s =~ /([^:]+):(.*)$/
+                cmd = $1.strip
+                suffix = $2
+            end
+            case cmd
+            when /^PING$/i
                 #dont bother about event loop here.
-                @actor[:ping][$1]
-            when /^NOTICE\s(.+)$/i, /:([^ ]+) +NOTICE\s(.+)$/i
-                @actor.push :servernotice, $1
-            when /^:([a-zA-Z0-9_.-]+)!.*PRIVMSG\s([0-9a-zA-Z_#-]+)\s:(.+)$/i
-                @actor.push :privmsg, $1.strip,$2.strip,$3.strip
-            when /^:([a-zA-Z0-9_.-]+)!.*JOIN\s:([0-9a-zA-Z_#-]+) *$/i
-                @actor.push :join, $1.strip,$2.strip
-            when /^:([a-zA-Z0-9_.-]+)!.*PART\s([0-9a-zA-Z_#-]+)\s(.+)$/i
-                @actor.push :part, $1.strip,$2.strip,$3.strip
-            when /^:([a-zA-Z0-9_.-]+) +([0-9]+) +([^:]+):(.+)$/i
-                server,numeric,msg,detail =  $1.strip,$2.strip.to_i,$3.strip,$4.strip
-                @actor.push :numeric, server,numeric,msg,detail
-            when /^:([a-zA-Z0-9_.-]+) +([0-9]+) +([^:]+)$/i
-                server,numeric,msg,detail =  $1.strip,$2.strip.to_i,$3.strip, ''
-                @actor.push :numeric, server,numeric,msg,detail
+                @actor[:ping][suffix]
+            when /^PONG$/i
+                @actor[:pong][suffix]
+            when /^NOTICE +(.+)$/i
+                @actor.push :notice, user, $1, suffix
+            when /^PRIVMSG +(.+)$/i
+                @actor.push :privmsg, user, $1, suffix
+            when /^JOIN$/i
+                #the confirmation join channel will come in suffix
+                @actor.push :join, user, suffix
+            when /^PART +(.+)$/i
+                #the confirmation part channel will come in cmd arg.
+                @actor.push :part, user, $1, suffix
+            when /^QUIT$/i
+                #the confirmation part channel will come in cmd arg.
+                @actor.push :quit, user, suffix
+            when /^([0-9]+) +(.+)$/i
+                server,numeric,msg,detail = prefix, $1.to_i,$2, suffix
+                @actor.push :numeric, server,numeric,msg,detail if !local_numeric(numeric,msg,detail)
             else
-                @actor.push :unknown, s
+                @actor.push :unknown, input
             end
         end
 
@@ -334,16 +311,91 @@ module IrcClient
             process(gets) while !@socket.eof?
         end
 
+        #WARNING: UGLY HACK. 
+        def local_numeric(numeric,msg,detail)
+            if @capture_numeric
+                case numeric
+                when ERR_NOSUCHNICK
+                    if msg =~ / *[^ ]+ +([^ ]+)*$/
+                        if $1 == @capture_channel
+                            @inputlock.synchronize {
+                                @args << [numeric,msg,detail]
+                                @inputqueue.signal
+                            }
+                            return true
+                        end
+                    end
+                when RPL_ENDOFNAMES
+                    if msg =~ / *[^ ]+ +([^ ]+)*$/
+                        if $1 == @capture_channel
+                            @inputlock.synchronize {
+                                @args << [numeric,msg,detail]
+                                @inputqueue.signal
+                            }
+                            return true
+                        end
+                    end
+                when RPL_NAMREPLY
+                    if msg =~ / *[^ ]+ *= +([^ ]+)*$/
+                        if $1 == @capture_channel
+                            @inputlock.synchronize {
+                                @args << [numeric,msg,detail]
+                                @inputqueue.signal
+                            }
+                            return true
+                        end
+                    end
+                end
+            end
+            return false #continue with processing
+        end
+
+        #will be invoked from a thread different from that of the
+        #primary IrcConnector thread.
+        def names(channel)
+            carp "invoke names for #{channel}"
+            @names = []
+            @args = []
+            @capture_channel = channel.chomp
+            @capture_numeric = true
+            send_names channel
+            while true
+                numeric, msg, detail = 0,'',''
+                @inputlock.synchronize {
+                    @inputqueue.wait(@inputlock) if @args.empty?
+                    numeric, msg, detail = @args.shift
+                }
+                case numeric
+                when ERR_NOSUCHNICK
+                    carp ERR_NOSUCHNICK
+                    break
+                when RPL_ENDOFNAMES
+                    carp "#{RPL_ENDOFNAMES} #{@names}"
+                    break
+                when RPL_NAMREPLY
+                    nicks = detail.split(/ +/)
+                    nicks.each {|n| @names << $1.strip if n =~ /^@?([^ ]+)/ }
+                    carp "nicks #{nicks}"
+                end
+            end
+            carp "returning #{@names}"
+            @capture_numeric = false
+            return @names
+        end
+
         #=====================================================
         def lock_read
             @readlock.lock
         end
+
         def unlock_read
             @readlock.unlock
         end
+
         def lock_write
             @writelock.lock
         end
+
         def unlock_write
             @writelock.unlock
         end
@@ -351,18 +403,23 @@ module IrcClient
         def send_pong(arg)
             send "PONG :#{arg}"
         end
+        
         def send_pass(pass)
             send "PASS #{pass}"
         end
+
         def send_nick(nick)
             send "NICK #{nick}"
         end
+
         def send_user(user,mode,unused,real)
             send "USER #{user} #{mode} #{unused} :#{real}"
         end
+
         def send_names(channel)
             send "NAMES #{channel}"
         end
+
         def send(msg)
             send "#{msg}"
         end
@@ -370,6 +427,7 @@ module IrcClient
         def send_join(channel)
             send "JOIN #{channel}"
         end
+
         def send_part(channel)
             send "PART #{channel} :"
         end
@@ -381,19 +439,25 @@ module IrcClient
         def msg_channel(channel, data)
             send "PRIVMSG #{channel} :#{data}"
         end
+        
+        def notice_channel(channel, data)
+            send "NOTICE #{channel} :#{data}"
+        end
 
         def gets
+            s = nil
             @readlock.synchronize { 
                 s = @socket.gets
-                carp "<#{s}"
-                return s 
             }
+            #carp "<#{s}"
+            return s 
         end
         
         def send(s)
-            carp ">#{s}"
+            #carp ">#{s}"
             @writelock.synchronize { @socket << "#{s}\n" }
         end
+
         #=====================================================
         def IrcConnector.start(opts={})
             server = opts[:server] or raise 'No server defined.'
@@ -444,15 +508,27 @@ module IrcClient
         def privmsg(nick, channel, msg)
             @actor[:privmsg].each{|c| c[nick, channel, msg]}
         end
+
+        def notice(nick, channel, msg)
+            @actor[:notice].each{|c| c[nick, channel, msg]}
+        end
+
         def join(nick, channel)
             @actor[:join].each{|c| c[nick, channel]}
         end
+
         def part(nick, channel, msg)
             @actor[:part].each{|c| c[nick, channel, msg]}
         end
+
+        def quit(nick, msg)
+            @actor[:quit].each{|c| c[nick, msg]}
+        end
+
         def numeric(server,numeric,msg, detail)
             @actor[:numeric].each{|c| c[server,numeric,msg,detail]}
         end
+
         def unknown(arg)
             @actor[:unknown].each{|c| c[arg]}
         end
@@ -465,24 +541,35 @@ module IrcClient
         def send_pass(arg)
             @ircserver.invoke :pass,arg
         end
+
         def send_nick(arg)
             @ircserver.invoke :nick,arg
         end
+
         def send_user(user,mode,unused,real)
             @ircserver.invoke :user, user, mode, unused, real
         end
+
         def send_names(arg)
             @ircserver.invoke :names,arg
         end
+
         def send_join(arg)
             @ircserver.invoke :join,arg
         end
-        def send_part(channel)
-            @ircserver.invoke :part,arg
+
+        def send_part(channel,msg)
+            @ircserver.invoke :part,channel.msg
         end
+        
+        def send_quit(msg)
+            @ircserver.invoke :quit,msg
+        end
+
         def msg_channel(channel, data)
             @ircserver.invoke :privmsg,channel, data
         end
+
         #=====================================================
         def names(channel)
             return @ircserver.names(channel)
@@ -505,6 +592,8 @@ module IrcClient
                 port = ARGV.shift
             when /-n/
                 nick = ARGV.shift
+            when /-v/
+                $verbose = true
             end
         end
         IrcConnector.start :server => server, 
