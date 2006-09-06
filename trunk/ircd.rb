@@ -1,6 +1,10 @@
 #!/usr/local/bin/ruby
 require 'webrick'
 require 'thread'
+require 'ircreplies'
+require 'netutils'
+
+include IRCReplies
 
 $config = {}
 $config['version'] = '0.1'
@@ -12,9 +16,11 @@ $config['starttime'] = Time.now.to_s
 $verbose = ARGV.shift || false
     
 CHANNEL = /^[#\$&]+/
+PREFIX  = /^:[^ ]+ +(.+)$/
 class UserStore
     @@registered_users = {}
     @@mutex = Mutex.new
+
     def UserStore.<<(client)
         @@mutex.synchronize {
             @@registered_users[client.nick] = client
@@ -47,6 +53,7 @@ end
 class ChannelStore
     @@mutex = Mutex.new
     @@registered_channels = {}
+
     def ChannelStore.<<(client)
         @@mutex.synchronize {
             @@registered_channels[client.nick] = client
@@ -105,14 +112,17 @@ end
 
 
 class IRCChannel
+    include NetUtils
     attr_reader :name, :topic
     @@mutex = Mutex.new
+
     def initialize(name)
         @clients = []
         @topic = "There is no topic"
         @name = name
         carp "create channel:#{@name}"
     end
+
     def join(client)
         @@mutex.synchronize {
             return false if @clients.include?(client)
@@ -120,34 +130,48 @@ class IRCChannel
         }
         #send join to each user in the channel
         eachuser {|user|
-            user.reply :join, client.user, @name
+            user.reply :join, client.userprefix, @name
         }
         return true
     end
+
     def part(client, msg)
         @@mutex.synchronize {
             @clients.delete(client)
         }
         eachuser {|user|
-            user.reply :part, client.user, @name, msg
+            user.reply :part, client.userprefix, @name, msg
         }
         ChannelStore.delete(@name) if @clients.empty?
     end
+
+    def quit(client, msg)
+        @@mutex.synchronize {
+            @clients.delete(client)
+        }
+        eachuser {|user|
+            user.reply :quit, client.userprefix, @name, msg if user!= client
+        }
+        ChannelStore.delete(@name) if @clients.empty?
+    end
+
     def privatemsg(msg, client)
         eachuser {|user|
-            user.reply :privmsg, client.user, @name, msg if user != client
+            user.reply :privmsg, client.userprefix, @name, msg if user != client
         }
     end
+
     def notice(msg, client)
         eachuser {|user|
-            user.reply :notice, client.user, @name, msg if user != client
+            user.reply :notice, client.userprefix, @name, msg if user != client
         }
     end
+
     def topic(msg=nil)
         return @topic if msg.nil?
         @topic = msg
         eachuser {|user|
-            user.reply :topic, user.user, @name, msg
+            user.reply :topic, user.userprefix, @name, msg
         }
         return @topic
     end
@@ -179,21 +203,11 @@ class IRCChannel
             }
         }
     end
-
-    def carp(arg)
-        if $verbose
-            case  true
-            when arg.instance_of?(Exception)
-                puts "#{self.class.to_s.downcase}:" + arg.message 
-                puts arg.backtrace.collect{|s| "#{self.class.to_s.downcase}:" + s}.join("\n")
-            else
-                puts "#{self.class.to_s.downcase}:" + arg
-            end
-        end
-    end
 end
 
 class IRCClient
+    include NetUtils
+
     def initialize(sock, serv)
         @serv = serv
         @socket = sock
@@ -207,7 +221,23 @@ class IRCClient
         return @nick
     end
 
+    def channels
+        return @channels
+    end
+
     def user
+        return @user
+    end
+
+    def realname
+        return @realname
+    end
+    
+    def host
+        return @peername
+    end
+
+    def userprefix
         return @usermsg
     end
 
@@ -278,6 +308,7 @@ class IRCClient
             end
         end
     end
+
     def handle_user(user, mode, unused, realname)
         @user = user
         @mode = mode
@@ -291,6 +322,7 @@ class IRCClient
     end
 
     def handle_newconnect(nick)
+        @alive = true
         @nick = nick
         @host = $config['hostname']
         @ver = $config['version']
@@ -314,32 +346,40 @@ class IRCClient
         client = "#{@nick}!#{@user}@#{@peername}"
         reply :numeric, RPL_WELCOME, @nick, "Welcome to this IRC server #{client}"
     end
+
     def repl_yourhost
         reply :numeric, RPL_YOURHOST, @nick, "Your host is #{@host}, running version #{@ver}"
     end
+
     def repl_created
         reply :numeric, RPL_CREATED, @nick, "This server was created #{@starttime}"
     end
+
     def repl_myinfo
         reply :numeric, RPL_MYINFO, @nick, "#{@host} #{@ver} #{@serv.usermodes} #{@serv.channelmodes}"
     end
+
     def repl_bounce(sever, port)
         reply :numeric, RPL_BOUNCE ,"Try server #{server}, port #{port}"
     end
+
     def repl_ison()
         #XXX TODO
         reply :numeric, RPL_ISON,"notimpl"
     end
+
     def repl_away()
         @away = true
         #XXX TODO
         reply :numeric, RPL_AWAY,"notimpl"
     end
+
     def repl_unaway()
         #XXX TODO
         @away = false
         reply :numeric, RPL_UNAWAY, @nick,"You are no longer marked as being away"
     end
+
     def repl_nowaway()
         #XXX TODO
         reply :numeric, RPL_NOWAWAY, @nick,"You have been marked as being away"
@@ -394,7 +434,7 @@ class IRCClient
             c = ch.strip
             if c !~ CHANNEL
                 send_nochannel(c)
-                carp "nosuchchannel:#{c}"
+                carp "no such channel:#{c}"
                 return
             end
             channel = ChannelStore.add(c)
@@ -428,7 +468,7 @@ class IRCClient
         else
             user = UserStore[target]
             if !user.nil?
-                user.reply :privmsg, self.user, user.nick, msg
+                user.reply :privmsg, self.userprefix, user.nick, msg
             else
                 send_nonick(target)
             end
@@ -447,7 +487,7 @@ class IRCClient
         else
             user = UserStore[target]
             if !user.nil?
-                user.reply :notice, self.user, user.nick, msg
+                user.reply :notice, self.userprefix, user.nick, msg
             else
                 send_nonick(target)
             end
@@ -455,17 +495,22 @@ class IRCClient
     end
 
     def handle_part(channel, msg)
+        @channels.delete(channel)
         ChannelStore[channel].part(self, msg)
     end
 
     def handle_quit(msg)
-        UserStore.delete(self.nick)
-        @channels.each do |channel| 
-            ChannelStore[channel].part(self, msg)
+        #do this to avoid double quit due to 2 threads.
+        return if !@alive
+        @alive = false
+        @channels.each do |channel|
+            ChannelStore[channel].quit(self, msg)
         end
+        UserStore.delete(self.nick)
         carp "#{self.nick} #{msg}"
         @socket.close if !@socket.closed?
     end
+
     def handle_topic(channel, topic)
         carp "handle topic for #{channel}:#{topic}"
         if topic.nil? or topic =~ /^ *$/
@@ -478,17 +523,39 @@ class IRCClient
             end
         end
     end
+
     def handle_list(channel)
     end
+
     def handle_whois(nick)
     end
+
     def handle_names(channels, server)
-        channels.split(/,/).each {|ch|
-            send_nameslist(ch.strip)
-        }
+        channels.split(/,/).each {|ch| send_nameslist(ch.strip) }
     end
-    def handle_who(channel, rest)
+
+    def handle_who(mask, rest)
+        channel = ChannelStore[mask]
+        hopcount = 0
+        if channel.nil?
+            #match against all users
+            UserStore.each {|user|
+                reply :numeric, RPL_WHOREPLY ,
+                    "#{user.channels[0]} #{user.userprefix} #{user.host} #{$config['hostname']} #{user.nick} H" , 
+                    "#{hopcount} #{user.realname}" if File.fnmatch?(mask, "#{user.host}.#{user.realname}.#{user.nick}")
+            }
+            reply :numeric, RPL_ENDOFWHO, mask, "End of /WHO list."
+        else
+            #get all users in the channel
+            channel.eachuser {|user|
+                reply :numeric, RPL_WHOREPLY ,
+                    "#{mask} #{user.userprefix} #{user.host} #{$config['hostname']} #{user.nick} H" , 
+                    "#{hopcount} #{user.realname}"
+            }
+            reply :numeric, RPL_ENDOFWHO, mask, "End of /WHO list."
+        end
     end
+
     def handle_mode(target, rest)
         #TODO: dummy
         reply :mode, target, rest
@@ -505,12 +572,19 @@ class IRCClient
 
     def handle_reload(password)
     end
+
     def handle_abort()
         handle_quit('aborted..')
     end
+
     def handle_version()
         reply :numeric, RPL_VERSION,"0.3 Ruby IRCD", ""
     end
+    
+    def handle_eval(s)
+        reply :raw, eval(s)
+    end
+
     def handle_unknown(s)
         carp "unknown:>#{s}<"
         reply :numeric, ERR_UNKNOWNCOMMAND,s, "Unknown command"
@@ -520,18 +594,6 @@ class IRCClient
         reply :raw, "NOTICE AUTH :#{$config['version']} initialized, welcome."
     end
     
-    def carp(arg)
-        if $verbose
-            case  true
-            when arg.kind_of?(Exception)
-                puts "#{self.class.to_s.downcase}:" + arg.message 
-                puts arg.backtrace.collect{|s| "#{self.class.to_s.downcase}:" + s}.join("\n")
-            else
-                puts "#{self.class.to_s.downcase}:" + arg
-            end
-        end
-    end
-
     def reply(method, *args)
         case method
         when :raw
@@ -546,6 +608,12 @@ class IRCClient
         when :join
             user,channel = args
             raw "#{user} JOIN :#{channel}"
+        when :part
+            user,channel,msg = args
+            raw "#{user} PART #{channel} :#{msg}"
+        when :quit
+            user,msg = args
+            raw "#{user} QUIT :#{msg}"
         when :privmsg
             usermsg, channel, msg = args
             raw "#{usermsg} PRIVMSG #{channel} :#{msg}"
@@ -573,7 +641,7 @@ class IRCClient
         carp "--> #{arg}"
         @socket.print arg.chomp + "\n" if !arg.nil?
         rescue Exception => e
-            carp "<#{self.user}>#{e.message}"
+            carp "<#{self.userprefix}>#{e.message}"
             #puts e.backtrace.join("\n")
             handle_abort()
             raise e if abrt
@@ -582,18 +650,22 @@ class IRCClient
 end
 
 class ProxyClient < IRCClient
+
     def initialize(nick, actor, serv)
         carp "Initializing service #{nick}"
         @nick = nick
         super(nil,serv)
         @conn = IrcClient::ProxyConnector.new(nick,'pass',self,actor)
     end
+
     def peer
         return @nick
     end
+
     def handle_connect
         @conn.connect
     end
+
     def getnick(user)
         if user =~ /(^[^!]+)!.*/
             return $1
@@ -601,6 +673,7 @@ class ProxyClient < IRCClient
             return user
         end
     end
+
     def reply(method, *args)
         case method
         when :raw
@@ -660,7 +733,10 @@ class ProxyClient < IRCClient
             handle_join channel
         when :part
             channel, msg = args
-            handle_join channel, msg
+            handle_part channel, msg
+        when :quit
+            msg = args
+            handle_quit msg
         when :privmsg
             channel, msg = args
             handle_privmsg channel, msg
@@ -671,6 +747,7 @@ class ProxyClient < IRCClient
 end
 
 class IRCServer < WEBrick::GenericServer
+    include NetUtils
     def usermodes
         return "aAbBcCdDeEfFGhHiIjkKlLmMnNopPQrRsStUvVwWxXyYzZ0123459*@"
     end
@@ -718,20 +795,13 @@ class IRCServer < WEBrick::GenericServer
         client.handle_abort()
     end
 
-    def carp(arg)
-        if $verbose
-            case  true
-            when arg.kind_of?(Exception)
-                puts "#{self.class.to_s.downcase}:" + arg.message 
-                puts arg.backtrace.collect{|s| "#{self.class.to_s.downcase}:" + s}.join("\n")
+    def handle_client_input(input, client)
+        carp "<-- #{input}"
+        s = if input =~ PREFIX
+                $1
             else
-                puts "#{self.class.to_s.downcase}:" + arg
+                input
             end
-        end
-    end
-
-    def handle_client_input(s, client)
-        carp "<-- #{s}"
         case s
         when /^[ ]*$/
             return
@@ -759,6 +829,8 @@ class IRCServer < WEBrick::GenericServer
             client.handle_notice($1, $2) #done
         when /^PART +([^ ]+) *(.*)$/i
             client.handle_part($1, $2) #done
+        when /^QUIT :(.*)$/i
+            client.handle_quit($1) #done
         when /^QUIT *(.*)$/i
             client.handle_quit($1) #done
         when /^TOPIC +([^ ]+) *:*(.*)$/i
@@ -773,21 +845,23 @@ class IRCServer < WEBrick::GenericServer
             client.handle_names($1, $2)
         when /^MODE +([^ ]+) *(.*)$/i
             client.handle_mode($1, $2)
+        when /^USERHOST +:(.+)$/i
+            #besirc does this (not accourding to RFC 2812)
+            client.handle_userhost($1)
         when /^USERHOST +(.+)$/i
             client.handle_userhost($1)
         when /^RELOAD +(.+)$/i
             client.handle_reload($1)
-        when /^EVAL (.*)$/i
-            #strictly for debug
-            s = eval($1)
-            carp s
-            client.reply "result:#{s}"
         when /^VERSION *$/i
             client.handle_version()
+        when /^EVAL (.*)$/i
+            #strictly for debug
+            client.handle_eval($1)
         else
             client.handle_unknown(s)
         end
     end
+
     def do_ping()
         while true
             sleep 60
@@ -798,148 +872,17 @@ class IRCServer < WEBrick::GenericServer
     end
 end
 
-#=====================NUMERICS===================
-RPL_WELCOME		=		001
-RPL_YOURHOST		=		002
-RPL_CREATED		=		003
-RPL_MYINFO		=		004
-RPL_BOUNCE		=		005
-RPL_USERHOST		=		302
-RPL_ISON		=		303
-RPL_AWAY		=		301
-RPL_UNAWAY		=		305
-RPL_NOWAWAY		=		306
-RPL_WHOISUSER		=		311
-RPL_WHOISSERVER		=		312
-RPL_WHOISOPERATOR		=		313
-RPL_WHOISIDLE		=		317
-RPL_ENDOFWHOIS		=		318
-RPL_WHOISCHANNELS		=		319
-RPL_WHOWASUSER		=		314
-RPL_ENDOFWHOWAS		=		369
-RPL_LISTSTART		=		321
-RPL_LIST		=		322
-RPL_LISTEND		=		323
-RPL_UNIQOPIS		=		325
-RPL_CHANNELMODEIS		=		324
-RPL_NOTOPIC		=		331
-RPL_TOPIC		=		332
-RPL_INVITING		=		341
-RPL_SUMMONING		=		342
-RPL_INVITELIST		=		346
-RPL_ENDOFINVITELIST		=		347
-RPL_EXCEPTLIST		=		348
-RPL_ENDOFEXCEPTLIST		=		349
-RPL_VERSION		=		351
-RPL_WHOREPLY		=		352
-RPL_ENDOFWHO		=		315
-RPL_NAMREPLY		=		353
-RPL_ENDOFNAMES		=		366
-RPL_LINKS		=		364
-RPL_ENDOFLINKS		=		365
-RPL_BANLIST		=		367
-RPL_ENDOFBANLIST		=		368
-RPL_INFO		=		371
-RPL_ENDOFINFO		=		374
-RPL_MOTDSTART		=		375
-RPL_MOTD		=		372
-RPL_ENDOFMOTD		=		376
-RPL_YOUREOPER		=		381
-RPL_REHASHING		=		382
-RPL_YOURESERVICE		=		383
-RPL_TIME		=		391
-RPL_USERSSTART		=		392
-RPL_USERS		=		393
-RPL_ENDOFUSERS		=		394
-RPL_NOUSERS		=		395
-RPL_TRACELINK		=		200
-RPL_TRACECONNECTING		=		201
-RPL_TRACEHANDSHAKE		=		202
-RPL_TRACEUNKNOWN		=		203
-RPL_TRACEOPERATOR		=		204
-RPL_TRACEUSER		=		205
-RPL_TRACESERVER		=		206
-RPL_TRACESERVICE		=		207
-RPL_TRACENEWTYPE		=		208
-RPL_TRACECLASS		=		209
-RPL_TRACERECONNECT		=		210
-RPL_TRACELOG		=		261
-RPL_TRACEEND		=		262
-RPL_STATSLINKINFO		=		211
-RPL_STATSCOMMANDS		=		212
-RPL_ENDOFSTATS		=		219
-RPL_STATSUPTIME		=		242
-RPL_STATSOLINE		=		243
-RPL_UMODEIS		=		221
-RPL_SERVLIST		=		234
-RPL_SERVLISTEND		=		235
-RPL_LUSERCLIENT		=		251
-RPL_LUSEROP		=		252
-RPL_LUSERUNKNOWN		=		253
-RPL_LUSERCHANNELS		=		254
-RPL_LUSERME		=		255
-RPL_ADMINME		=		256
-RPL_ADMINEMAIL		=		259
-RPL_TRYAGAIN		=		263
-ERR_NOSUCHNICK		=		401
-ERR_NOSUCHSERVER		=		402
-ERR_NOSUCHCHANNEL		=		403
-ERR_CANNOTSENDTOCHAN		=		404
-ERR_TOOMANYCHANNELS		=		405
-ERR_WASNOSUCHNICK		=		406
-ERR_TOOMANYTARGETS		=		407
-ERR_NOSUCHSERVICE		=		408
-ERR_NOORIGIN		=		409
-ERR_NORECIPIENT		=		411
-ERR_NOTEXTTOSEND		=		412
-ERR_NOTOPLEVEL		=		413
-ERR_WILDTOPLEVEL		=		414
-ERR_BADMASK		=		415
-ERR_UNKNOWNCOMMAND		=		421
-ERR_NOMOTD		=		422
-ERR_NOADMININFO		=		423
-ERR_FILEERROR		=		424
-ERR_NONICKNAMEGIVEN		=		431
-ERR_ERRONEUSNICKNAME		=		432
-ERR_NICKNAMEINUSE		=		433
-ERR_NICKCOLLISION		=		436
-ERR_UNAVAILRESOURCE		=		437
-ERR_USERNOTINCHANNEL		=		441
-ERR_NOTONCHANNEL		=		442
-ERR_USERONCHANNEL		=		443
-ERR_NOLOGIN		=		444
-ERR_SUMMONDISABLED		=		445
-ERR_USERSDISABLED		=		446
-ERR_NOTREGISTERED		=		451
-ERR_NEEDMOREPARAMS		=		461
-ERR_ALREADYREGISTRED		=		462
-ERR_NOPERMFORHOST		=		463
-ERR_PASSWDMISMATCH		=		464
-ERR_YOUREBANNEDCREEP		=		465
-ERR_YOUWILLBEBANNED		=		466
-ERR_KEYSET		=		467
-ERR_CHANNELISFULL		=		471
-ERR_UNKNOWNMODE		=		472
-ERR_INVITEONLYCHAN		=		473
-ERR_BANNEDFROMCHAN		=		474
-ERR_BADCHANNELKEY		=		475
-ERR_BADCHANMASK		=		476
-ERR_NOCHANMODES		=		477
-ERR_BANLISTFULL		=		478
-ERR_NOPRIVILEGES		=		481
-ERR_CHANOPRIVSNEEDED		=		482
-ERR_CANTKILLSERVER		=		483
-ERR_RESTRICTED		=		484
-ERR_UNIQOPPRIVSNEEDED		=		485
-ERR_NOOPERHOST		=		491
-ERR_UMODEUNKNOWNFLAG		=		501
-ERR_USERSDONTMATCH		=		502
-#================================================
 
 if __FILE__ == $0
-    require 'ircclient'
+    #require 'ircclient'
     s = IRCServer.new( :Port => $config['port'] )
     begin
+        while arg = ARGV.shift
+            case arg
+            when /-v/
+                $verbose = true
+            end
+        end
         trap("INT"){ 
             s.carp "killing #{$$}"
             system("kill -9 #{$$}")
@@ -949,7 +892,7 @@ if __FILE__ == $0
             s.do_ping()
         }
         
-        s.addservice('serviceclient',IrcClient::TestActor)
+        #s.addservice('serviceclient',IrcClient::TestActor)
         s.start
 
         #p.join
