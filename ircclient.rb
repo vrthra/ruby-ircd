@@ -10,6 +10,7 @@ module IrcClient
     # The irc class, which talks to the server and holds the main event loop
     class IrcActor
         include NetUtils
+        attr_reader :channels
         #=========================================================== 
         #events
         #=========================================================== 
@@ -18,6 +19,7 @@ module IrcClient
             @eventqueue = ConditionVariable.new
             @eventlock = Mutex.new
             @events = []
+            @channels = {}
             @store = {
                 :ping => 
                 Proc.new {|server|
@@ -58,7 +60,7 @@ module IrcClient
                 }],
                 :quit=>
                 [Proc.new {|nick,msg|
-                    #puts "on part"
+                    #puts "on quit"
                 }],
                 :unknown =>
                 [Proc.new {|line|
@@ -126,14 +128,17 @@ module IrcClient
         
         def send_names(channel)
             @client.send_names channel
+            channel
         end
 
         def send_message(user,message)
             @client.msg_user user, message
+            user
         end
         
         def send(message)
             @client.send message
+            message
         end
 
         def run
@@ -155,10 +160,17 @@ module IrcClient
 
         def join(channel)
             @client.send_join channel
+            @channels[channel] = Time.now
+            channel
         end
 
         def part(channel)
-            @client.send_part channel
+            if @channels.delete(channel)
+                @client.send_part channel
+                channel
+            else
+                'not member'
+            end
         end
 
         def nick
@@ -188,7 +200,7 @@ module IrcClient
                 #puts "#{nick} part-:#{channel}"
             }
             on(:quit) {|nick,msg|
-                #puts "#{nick} part-:#{channel}"
+                #puts "#{nick} quit-:#{channel}"
             }
         end
     end
@@ -208,7 +220,7 @@ module IrcClient
                 puts "#{nick} part-:#{channel}"
             }
             on(:quit) {|nick,msg|
-                puts "#{nick} part-:#{channel}"
+                puts "#{nick} quit-:#{nick}:#{msg}"
             }
             on(:privmsg) {|nick,channel,msg|
                 case msg
@@ -297,7 +309,6 @@ module IrcClient
                 #the confirmation part channel will come in cmd arg.
                 @actor.push :part, user, $1, suffix
             when /^QUIT$/i
-                #the confirmation part channel will come in cmd arg.
                 @actor.push :quit, user, suffix
             when /^([0-9]+) +(.+)$/i
                 server,numeric,msg,detail = prefix, $1.to_i,$2, suffix
@@ -403,7 +414,7 @@ module IrcClient
         def send_pong(arg)
             send "PONG :#{arg}"
         end
-        
+
         def send_pass(pass)
             send "PASS #{pass}"
         end
@@ -457,7 +468,6 @@ module IrcClient
             #carp ">#{s}"
             @writelock.synchronize { @socket << "#{s}\n" }
         end
-
         #=====================================================
         def IrcConnector.start(opts={})
             server = opts[:server] or raise 'No server defined.'
@@ -558,18 +568,13 @@ module IrcClient
             @ircserver.invoke :join,arg
         end
 
-        def send_part(channel,msg)
-            @ircserver.invoke :part,channel.msg
-        end
-        
-        def send_quit(msg)
-            @ircserver.invoke :quit,msg
+        def send_part(channel)
+            @ircserver.invoke :part,arg
         end
 
         def msg_channel(channel, data)
             @ircserver.invoke :privmsg,channel, data
         end
-
         #=====================================================
         def names(channel)
             return @ircserver.names(channel)

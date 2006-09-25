@@ -6,207 +6,162 @@ require 'netutils'
 
 include IRCReplies
 
-$config = {}
-$config['version'] = '0.1'
+$config ||= {}
+$config['version'] = '0.04dev'
 $config['timeout'] = 10
 $config['port'] = 6667
 $config['hostname'] = Socket.gethostname.split(/\./).shift
 $config['starttime'] = Time.now.to_s
+$config['nick-tries'] = 5
 
 $verbose = ARGV.shift || false
     
 CHANNEL = /^[#\$&]+/
 PREFIX  = /^:[^ ]+ +(.+)$/
-class UserStore
-    @@registered_users = {}
-    @@mutex = Mutex.new
 
-    def UserStore.<<(client)
-        @@mutex.synchronize {
-            @@registered_users[client.nick] = client
-        }
+class SynchronizedStore
+    def initialize
+        @store = {}
+        @mutex = Mutex.new
+    end
+    
+    def method_missing(name,*args)
+        @mutex.synchronize { @store.__send__(name,*args) }
     end
 
-    def UserStore.[](nick)
-        client = nil
-        @@mutex.synchronize {
-            client = @@registered_users[nick]
-        }
-        return client
-    end
-
-    def UserStore.delete(nick)
-        @@mutex.synchronize {
-            @@registered_users.delete(nick)
-        }
-    end
-
-    def UserStore.each
-        @@registered_users.values.each {|u|
-            @@mutex.synchronize {
-                yield u 
+    def each_value
+        @mutex.synchronize do
+            @store.each_value {|u|
+                @mutex.unlock
+                yield u
+                @mutex.lock
             }
-        }
-    end
-end
-
-class ChannelStore
-    @@mutex = Mutex.new
-    @@registered_channels = {}
-
-    def ChannelStore.<<(client)
-        @@mutex.synchronize {
-            @@registered_channels[client.nick] = client
-        }
-    end
-
-    def ChannelStore.[](c)
-        @@mutex.synchronize {
-            return @@registered_channels[c]
-        }
-    end
-
-    def ChannelStore.add(c)
-        channel = nil
-        @@mutex.synchronize {
-            if @@registered_channels[c].nil?
-                channel = IRCChannel.new(c)
-                @@registered_channels[c] = channel
-            else
-                channel = @@registered_channels[c]
-            end
-        }
-        return channel
-    end
-
-    def ChannelStore.delete(c)
-        carp "channel #{c} deleted.."
-        @@mutex.synchronize {
-            @@registered_channels.delete(c)
-        }
-    end
-
-    def ChannelStore.each
-        @@registered_channels.values.each do |c|
-            #this will cause prob if some one using the 
-            #value *and* calling to any of the above
-            #how ever this should not happen.
-            @@mutex.synchronize do
-                yield c 
-            end
         end
     end
 
-    def ChannelStore.carp(arg)
-        if $verbose
-            case  true
-            when arg.kind_of?(Exception)
-                puts "#{self.class.to_s.downcase}:" + arg.message 
-                puts arg.backtrace.collect{|s| "#{self.class.to_s.downcase}:" + s}.join("\n")
-            else
-                puts "#{self.class.to_s.downcase}:" + arg
-            end
-        end
+    def keys
+        @mutex.synchronize{@store.keys}
     end
 end
 
+$user_store = SynchronizedStore.new
+class << $user_store
+    def <<(client)
+        self[client.nick] = client
+    end
+    
+    alias nicks keys
+    alias each_user each_value 
+end
 
-class IRCChannel
+$channel_store = SynchronizedStore.new
+class << $channel_store
+    def add(c)
+        self[c] ||= IRCChannel.new(c)
+    end
+
+    def remove(c)
+        self.delete[c]
+    end
+    
+    alias each_channel each_value 
+    alias channels keys
+end
+
+class IRCChannel < SynchronizedStore
     include NetUtils
     attr_reader :name, :topic
-    @@mutex = Mutex.new
+    alias each_user each_value 
 
     def initialize(name)
-        @clients = []
+        super()
+
         @topic = "There is no topic"
         @name = name
+        @oper = []
         carp "create channel:#{@name}"
     end
 
+    def add(client)
+        @oper << client.nick if @oper.empty? and @store.empty?
+        self[client.nick] = client
+    end
+    
+    def remove(client)
+        delete(client.nick)
+    end
+
     def join(client)
-        @@mutex.synchronize {
-            return false if @clients.include?(client)
-            @clients << client 
-        }
+        return false if is_member? client
+        add client
         #send join to each user in the channel
-        eachuser {|user|
+        each_user {|user|
             user.reply :join, client.userprefix, @name
         }
         return true
     end
 
     def part(client, msg)
-        @@mutex.synchronize {
-            @clients.delete(client)
-        }
-        eachuser {|user|
+        return false if !is_member? client
+        each_user {|user|
             user.reply :part, client.userprefix, @name, msg
         }
-        ChannelStore.delete(@name) if @clients.empty?
+        remove client
+        $channel_store.delete(@name) if self.empty?
+        return true
     end
 
     def quit(client, msg)
-        @@mutex.synchronize {
-            @clients.delete(client)
-        }
-        eachuser {|user|
+        #remove client should happen before sending notification
+        #to others since we dont want a notification to ourselves
+        #after quit.
+        remove client
+        each_user {|user|
             user.reply :quit, client.userprefix, @name, msg if user!= client
         }
-        ChannelStore.delete(@name) if @clients.empty?
+        $channel_store.delete(@name) if self.empty?
     end
 
     def privatemsg(msg, client)
-        eachuser {|user|
+        each_user {|user|
             user.reply :privmsg, client.userprefix, @name, msg if user != client
         }
     end
 
     def notice(msg, client)
-        eachuser {|user|
+        each_user {|user|
             user.reply :notice, client.userprefix, @name, msg if user != client
         }
     end
 
-    def topic(msg=nil)
+    def topic(msg=nil,client=nil)
         return @topic if msg.nil?
         @topic = msg
-        eachuser {|user|
-            user.reply :topic, user.userprefix, @name, msg
+        each_user {|user|
+            user.reply :topic, client.userprefix, @name, msg
         }
         return @topic
     end
 
-    def clients
-        return @clients
-    end
-
-    def names
-        return @clients.collect{|c|c.nick}
+    def nicks
+        return keys
     end
 
     def mode(u)
-        return u == @clients[0] ? '@' : ''
+        return @oper.include?(u.nick) ? '@' : ''
     end
 
-    def remove_nick(nick)
-        @@mutex.synchronize {
-            @clients.delete_if{|c| c.nick == nick}
-        }
+    def is_member?(m)
+        values.include?(m)
     end
 
-    def eachuser
-        @@mutex.synchronize {
-            @clients.each {|c|
-            @@mutex.unlock
-                yield c 
-            @@mutex.lock
-            }
-        }
-    end
+    alias has_nick? is_member?
 end
 
 class IRCClient
     include NetUtils
+
+    attr_reader :nick, :user, :realname, :channels
 
     def initialize(sock, serv)
         @serv = serv
@@ -214,25 +169,10 @@ class IRCClient
         @channels = []
         @peername = peer()
         @welcomed = false
+        @nick_tries = 0
         carp "initializing connection from #{@peername}"
     end
 
-    def nick
-        return @nick
-    end
-
-    def channels
-        return @channels
-    end
-
-    def user
-        return @user
-    end
-
-    def realname
-        return @realname
-    end
-    
     def host
         return @peername
     end
@@ -242,7 +182,7 @@ class IRCClient
     end
 
     def closed?
-        return !@socket.nil? && !@socket.closed?
+        return @socket.nil? || @socket.closed?
     end
 
     def ready
@@ -270,22 +210,22 @@ class IRCClient
     
     def handle_nick(s)
         carp "nick => #{s}"
-        if UserStore[s].nil?
+        if $user_store[s].nil?
             userlist = {}
             if @nick.nil?
                 handle_newconnect(s)
             else
                 userlist[s] = self if self.nick != s
-                UserStore.delete(@nick)
+                $user_store.delete(@nick)
                 @nick = s
             end
 
-            UserStore << self
+            $user_store << self
 
             #send the info to the world
             #get unique users.
             @channels.each {|c|
-                ChannelStore[c].eachuser {|u|
+                $channel_store[c].each_user {|u|
                     userlist[u.nick] = u
                 }
             }
@@ -295,18 +235,23 @@ class IRCClient
             @usermsg = ":#{@nick}!~#{@user}@#{@peername}"
         else
             #check if we are just nicking ourselves.
-            if !UserStore[s] == self
+            unless $user_store[s] == self
                 #verify the connectivity of earlier guy
-                if !UserStore[s].closed?
+                unless $user_store[s].closed?
                     reply :numeric, ERR_NICKNAMEINUSE,"* #{s} ","Nickname is already in use."
-                    carp "kicking spurious user #{s}"
-                    handle_abort
+                    @nick_tries += 1
+                    if @nick_tries > $config['nick-tries']
+                        carp "kicking spurious user #{s} after #{@nick_tries} tries"
+                        handle_abort
+                    end
+                    return
                 else
-                    UserStore[s].handle_abort
-                    UserStore[s] = self
+                    $user_store[s].handle_abort
+                    $user_store[s] = self
                 end
             end
         end
+        @nick_tries = 0
     end
 
     def handle_user(user, mode, unused, realname)
@@ -403,22 +348,30 @@ class IRCClient
         reply :numeric, ERR_NOSUCHCHANNEL, channel, "That channel doesn't exist"
     end
 
+    def send_notonchannel(channel)
+        reply :numeric, ERR_NOTONCHANNEL, channel, "Not a member of that channel"
+    end
+
     def send_topic(channel)
-        reply :numeric, RPL_TOPIC,channel, "#{ChannelStore[channel].topic}"
+        if $channel_store[channel]
+            reply :numeric, RPL_TOPIC,channel, "#{$channel_store[channel].topic}" 
+        else
+            send_notonchannel channel
+        end
     end
 
     def names(channel)
-        return ChannelStore[channel].names
+        return $channel_store[channel].nicks
     end
 
     def send_nameslist(channel)
-        c =  ChannelStore[channel]
+        c =  $channel_store[channel]
         if c.nil?
             carp "names failed :#{c}"
             return 
         end
         names = []
-        c.eachuser {|user|
+        c.each_user {|user|
             names << c.mode(user) + user.nick if user.nick
         }
         reply :numeric, RPL_NAMREPLY,"= #{c.name}","#{names.join(' ')}"
@@ -437,7 +390,7 @@ class IRCClient
                 carp "no such channel:#{c}"
                 return
             end
-            channel = ChannelStore.add(c)
+            channel = $channel_store.add(c)
             if channel.join(self)
                 send_topic(c)
                 send_nameslist(c)
@@ -459,14 +412,14 @@ class IRCClient
     def handle_privmsg(target, msg)
         case target.strip
         when CHANNEL
-            channel= ChannelStore[target]
+            channel= $channel_store[target]
             if !channel.nil?
                 channel.privatemsg(msg, self)
             else
                 send_nonick(target)
             end
         else
-            user = UserStore[target]
+            user = $user_store[target]
             if !user.nil?
                 user.reply :privmsg, self.userprefix, user.nick, msg
             else
@@ -478,14 +431,14 @@ class IRCClient
     def handle_notice(target, msg)
         case target.strip
         when CHANNEL
-            channel= ChannelStore[target]
+            channel= $channel_store[target]
             if !channel.nil?
                 channel.notice(msg, self)
             else
                 send_nonick(target)
             end
         else
-            user = UserStore[target]
+            user = $user_store[target]
             if !user.nil?
                 user.reply :notice, self.userprefix, user.nick, msg
             else
@@ -495,8 +448,15 @@ class IRCClient
     end
 
     def handle_part(channel, msg)
-        @channels.delete(channel)
-        ChannelStore[channel].part(self, msg)
+        if $channel_store.channels.include? channel
+            if $channel_store[channel].part(self, msg)
+                @channels.delete(channel)
+            else
+                send_notonchannel channel
+            end
+        else
+            send_nochannel channel
+        end
     end
 
     def handle_quit(msg)
@@ -504,9 +464,9 @@ class IRCClient
         return if !@alive
         @alive = false
         @channels.each do |channel|
-            ChannelStore[channel].quit(self, msg)
+            $channel_store[channel].quit(self, msg)
         end
-        UserStore.delete(self.nick)
+        $user_store.delete(self.nick)
         carp "#{self.nick} #{msg}"
         @socket.close if !@socket.closed?
     end
@@ -517,17 +477,46 @@ class IRCClient
             send_topic(channel)
         else
             begin
-                ChannelStore[channel].topic(topic)
+                $channel_store[channel].topic(topic,self)
             rescue Exception => e
                 carp e
             end
         end
     end
-
+        
     def handle_list(channel)
+        reply :numeric, RPL_LISTSTART
+        case channel.strip
+        when /^#/
+            channel.split(/,/).each {|cname|
+                c = $channel_store[cname.strip]
+                reply :numeric, RPL_LIST, c.name, c.topic if c
+            }
+        else
+            #older opera client sends LIST <1000
+            #we wont obey the boolean after list, but allow the listing
+            #nonetheless
+            $channel_store.each_channel {|c|
+                reply :numeric, RPL_LIST, c.name, c.topic
+            }
+        end
+        reply :numeric, RPL_LISTEND
     end
 
-    def handle_whois(nick)
+    def handle_whois(target,nicks)
+        #ignore target for now.
+        return reply(:numeric, RPL_NONICKNAMEGIVEN, "", "No nickname given") if nicks.strip.length == 0
+        nicks.split(/,/).each {|nick|
+            nick.strip!
+            user = $user_store[nick]
+            if user
+                reply :numeric, RPL_WHOISUSER, "#{user.nick} #{user.user} #{user.host} *", "#{user.realname}"
+                reply :numeric, RPL_WHOISCHANNELS, user.nick, "#{user.channels.join(' ')}"
+                reply :numeric, RPL_ENDOFWHOIS, user.nick, "End of /WHOIS list"
+            else
+                return send_nonick(nick) 
+            end
+        }
     end
 
     def handle_names(channels, server)
@@ -535,11 +524,11 @@ class IRCClient
     end
 
     def handle_who(mask, rest)
-        channel = ChannelStore[mask]
+        channel = $channel_store[mask]
         hopcount = 0
         if channel.nil?
             #match against all users
-            UserStore.each {|user|
+            $user_store.each_user {|user|
                 reply :numeric, RPL_WHOREPLY ,
                     "#{user.channels[0]} #{user.userprefix} #{user.host} #{$config['hostname']} #{user.nick} H" , 
                     "#{hopcount} #{user.realname}" if File.fnmatch?(mask, "#{user.host}.#{user.realname}.#{user.nick}")
@@ -547,7 +536,7 @@ class IRCClient
             reply :numeric, RPL_ENDOFWHO, mask, "End of /WHO list."
         else
             #get all users in the channel
-            channel.eachuser {|user|
+            channel.each_user {|user|
                 reply :numeric, RPL_WHOREPLY ,
                     "#{mask} #{user.userprefix} #{user.host} #{$config['hostname']} #{user.nick} H" , 
                     "#{hopcount} #{user.realname}"
@@ -564,7 +553,7 @@ class IRCClient
     def handle_userhost(nicks)
         info = []
         nicks.split(/,/).each {|nick|
-            user = UserStore[nick]
+            user = $user_store[nick]
             info << user.nick + '=-' + user.nick + '@' + user.peer
         }
         reply :numeric, RPL_USERHOST,"", info.join(' ')
@@ -576,9 +565,9 @@ class IRCClient
     def handle_abort()
         handle_quit('aborted..')
     end
-
+        
     def handle_version()
-        reply :numeric, RPL_VERSION,"0.3 Ruby IRCD", ""
+        reply :numeric, RPL_VERSION,"#{$config['version']} Ruby IRCD", ""
     end
     
     def handle_eval(s)
@@ -667,7 +656,7 @@ class ProxyClient < IRCClient
     end
 
     def getnick(user)
-        if user =~ /(^[^!]+)!.*/
+        if user =~ /^:([^!]+)!.*/
             return $1
         else
             return user
@@ -827,6 +816,9 @@ class IRCServer < WEBrick::GenericServer
             client.handle_privmsg($1, $2) #done
         when /^NOTICE +([^ ]+) +(.*)$/i
             client.handle_notice($1, $2) #done
+        when /^PART :+([^ ]+) *(.*)$/i  
+            #some clients require this.
+            client.handle_part($1, $2) #done
         when /^PART +([^ ]+) *(.*)$/i
             client.handle_part($1, $2) #done
         when /^QUIT :(.*)$/i
@@ -837,8 +829,10 @@ class IRCServer < WEBrick::GenericServer
             client.handle_topic($1, $2) #done
         when /^LIST *(.*)$/i
             client.handle_list($1)
-        when /^WHOIS +(.+)$/i
-            client.handle_whois($1)
+        when /^WHOIS +([^ ]+) +(.+)$/i
+            client.handle_whois($1,$2)
+        when /^WHOIS +([^ ]+)$/i
+            client.handle_whois(nil,$1)
         when /^WHO +([^ ]+) *(.*)$/i
             client.handle_who($1, $2)
         when /^NAMES +([^ ]+) *(.*)$/i
@@ -865,7 +859,7 @@ class IRCServer < WEBrick::GenericServer
     def do_ping()
         while true
             sleep 60
-            UserStore.each {|client|
+            $user_store.each_user {|client|
                 client.send_ping
             }
         end
