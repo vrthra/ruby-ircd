@@ -593,7 +593,11 @@ class IRCClient
             raw "PING :#{host}"
         when :pong
             msg = *args
-            raw "#{@host} PONG #{@peername} :#{msg}"
+            # according to rfc 2812 the PONG must be of
+            #PONG csd.bu.edu tolsun.oulu.fi
+            # PONG message from csd.bu.edu to tolsun.oulu.fi
+            # ie no host at the begining
+            raw "PONG #{@host} #{@peername} :#{msg}"
         when :join
             user,channel = args
             raw "#{user} JOIN :#{channel}"
