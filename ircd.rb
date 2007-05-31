@@ -161,7 +161,7 @@ end
 class IRCClient
     include NetUtils
 
-    attr_reader :nick, :user, :realname, :channels
+    attr_reader :nick, :user, :realname, :channels, :state
 
     def initialize(sock, serv)
         @serv = serv
@@ -170,6 +170,7 @@ class IRCClient
         @peername = peer()
         @welcomed = false
         @nick_tries = 0
+        @state = {}
         carp "initializing connection from #{@peername}"
     end
 
@@ -313,20 +314,15 @@ class IRCClient
         reply :numeric, RPL_ISON,"notimpl"
     end
 
-    def repl_away()
-        @away = true
-        #XXX TODO
-        reply :numeric, RPL_AWAY,"notimpl"
+    def repl_away(nick, msg)
+        reply :numeric, RPL_AWAY, nick, msg
     end
 
     def repl_unaway()
-        #XXX TODO
-        @away = false
         reply :numeric, RPL_UNAWAY, @nick,"You are no longer marked as being away"
     end
 
     def repl_nowaway()
-        #XXX TODO
         reply :numeric, RPL_NOWAWAY, @nick,"You have been marked as being away"
     end
 
@@ -421,6 +417,9 @@ class IRCClient
         else
             user = $user_store[target]
             if !user.nil?
+                if !user.state[:away].nil?
+                    repl_away(user.nick,user.state[:away])
+                end
                 user.reply :privmsg, self.userprefix, user.nick, msg
             else
                 send_nonick(target)
@@ -483,6 +482,17 @@ class IRCClient
             end
         end
     end
+
+    def handle_away(msg)
+        carp "handle away :#{msg}"
+        if msg.nil? or msg =~ /^ *$/
+            @state.delete(:away)
+            repl_unaway
+        else
+            @state[:away] = msg
+            repl_nowaway
+        end
+    end
         
     def handle_list(channel)
         reply :numeric, RPL_LISTSTART
@@ -512,6 +522,7 @@ class IRCClient
             if user
                 reply :numeric, RPL_WHOISUSER, "#{user.nick} #{user.user} #{user.host} *", "#{user.realname}"
                 reply :numeric, RPL_WHOISCHANNELS, user.nick, "#{user.channels.join(' ')}"
+                repl_away user.nick, user.state[:away] if !user.state[:away].nil?
                 reply :numeric, RPL_ENDOFWHOIS, user.nick, "End of /WHOIS list"
             else
                 return send_nonick(nick) 
@@ -831,6 +842,12 @@ class IRCServer < WEBrick::GenericServer
             client.handle_quit($1) #done
         when /^TOPIC +([^ ]+) *:*(.*)$/i
             client.handle_topic($1, $2) #done
+        when /^AWAY +:(.*)$/i
+            client.handle_away($1)
+        when /^AWAY +(.*)$/i #for opera
+            client.handle_away($1)
+        when /^:*([^ ])* *AWAY *$/i
+            client.handle_away(nil)
         when /^LIST *(.*)$/i
             client.handle_list($1)
         when /^WHOIS +([^ ]+) +(.+)$/i
