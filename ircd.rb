@@ -7,7 +7,7 @@ require 'netutils'
 include IRCReplies
 
 $config ||= {}
-$config['version'] = '0.04dev'
+$config['version'] = '0.05dev'
 $config['timeout'] = 10
 $config['port'] = 6667
 $config['hostname'] = Socket.gethostname.split(/\./).shift
