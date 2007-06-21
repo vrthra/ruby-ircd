@@ -231,7 +231,7 @@ class IRCClient
                 }
             }
             userlist.values.each {|user|
-                user.reply :nick, s
+                user.reply :raw, "#{@usermsg} NICK :#{nick}"
             }
             @usermsg = ":#{@nick}!~#{@user}@#{@peername}"
         else
