@@ -13,6 +13,7 @@ $config['port'] = 6667
 $config['hostname'] = Socket.gethostname.split(/\./).shift
 $config['starttime'] = Time.now.to_s
 $config['nick-tries'] = 5
+$config['motd'] = (begin File.readlines('MOTD') rescue ['Do the dance see the source'] end)
 
 $verbose = ARGV.shift || false
     
@@ -328,7 +329,7 @@ class IRCClient
 
     def repl_motd()
         reply :numeric, RPL_MOTDSTART,'', "- Message of the Day"
-        reply :numeric, RPL_MOTD,'',      "- Do the dance see the source"
+        $config['motd'].each {|l| reply :numeric, RPL_MOTD,'', '- ' + l}
         reply :numeric, RPL_ENDOFMOTD,'', "- End of /MOTD command."
     end
 
