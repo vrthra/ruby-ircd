@@ -891,7 +891,7 @@ end
 
 if __FILE__ == $0
     #require 'ircclient'
-    s = IRCServer.new( :Port => $config['port'] )
+    s = IRCServer.new( :BindAddress => $config['hostname'], :Port => $config['port'] )
     begin
         while arg = ARGV.shift
             case arg
