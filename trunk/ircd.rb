@@ -763,6 +763,9 @@ class IRCServer < WEBrick::GenericServer
 
     def run(sock)
         client = IRCClient.new(sock, self)
+
+        # if connection pasword is set, check for password on connection
+        handle_client_auth(sock, client)
         client.handle_connect
         irc_listen(sock, client)
     end
@@ -798,6 +801,21 @@ class IRCServer < WEBrick::GenericServer
             carp e
         end
         client.handle_abort()
+    end
+
+    def handle_client_auth(sock, client)
+        if $config[:ConnectPassword]
+            # First line from the socket needs to be PASS          
+            case sock.gets
+                # regexp password from socket string
+            when /^PASS +(.+)$/i
+                if $1.strip != $config[:ConnectPassword]
+                    client.reply( :numeric, ERR_PASSWDMISMATCH, 'password', 'password invalid' )
+                end
+            else
+                client.reply( :numeric, ERR_NEEDMOREPARAMS, 'password', 'password is required to connect' )
+            end
+        end
     end
 
     def handle_client_input(input, client)
