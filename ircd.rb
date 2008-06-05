@@ -804,12 +804,12 @@ class IRCServer < WEBrick::GenericServer
     end
 
     def handle_client_auth(sock, client)
-        if $config[:ConnectPassword]
+        if @config[:ConnectPassword]
             # First line from the socket needs to be PASS          
             case sock.gets
                 # regexp password from socket string
             when /^PASS +(.+)$/i
-                if $1.strip != $config[:ConnectPassword]
+                if $1.strip != @config[:ConnectPassword]
                     client.reply( :numeric, ERR_PASSWDMISMATCH, 'password', 'password invalid' )
                 end
             else
